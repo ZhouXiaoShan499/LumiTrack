@@ -599,7 +599,7 @@ static void app_lvgl_display(void)
     lbl_title = lv_label_create(scr);
     lv_label_set_text(lbl_title, "LumiTrack");
     lv_obj_set_style_text_color(lbl_title, lv_color_hex(0x00E5FF), 0);
-    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_16, 0);
     lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 6);
     prev = lbl_title;
 
@@ -693,7 +693,7 @@ static void app_lvgl_display(void)
     lbl_perf = lv_label_create(scr);
     lv_label_set_text(lbl_perf, "30fps  5% cpu");
     lv_obj_set_style_text_color(lbl_perf, lv_color_hex(0x334455), 0);
-    lv_obj_set_style_text_font(lbl_perf, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_font(lbl_perf, &lv_font_montserrat_12, 0);
     lv_obj_align_to(lbl_perf, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
 
     bsp_display_unlock();
