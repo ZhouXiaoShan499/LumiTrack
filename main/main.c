@@ -44,15 +44,13 @@ static lv_disp_rotation_t rotation = LV_DISPLAY_ROTATION_0;
 
 /* ── LumiTrack UI Objects ── */
 static lv_obj_t *lbl_title;
-static lv_obj_t *lbl_date;
-static lv_obj_t *lbl_status_header;
-static lv_obj_t *lbl_activity;
-static lv_obj_t *lbl_activity_duration;
-static lv_obj_t *lbl_focus_header;
-static lv_obj_t *lbl_focus_time;
-static lv_obj_t *lbl_daily_header;
-static lv_obj_t *lbl_daily_time;
-static lv_obj_t *lbl_light_status;
+static lv_obj_t *lbl_status_mode;       /* "当前状态：自动识别 · 看书模式" */
+static lv_obj_t *lbl_focus_time;        /* large timer (reused from old code) */
+static lv_obj_t *lbl_focus_desc;        /* "本次专注时长 | 实时统计" */
+static lv_obj_t *lbl_daily_stats;       /* "📊 今日累计  专注 04:12  休息 00:45" */
+static lv_obj_t *lbl_quick_tags;        /* "🏷️ 看书 学习 看电脑 看手机" */
+static lv_obj_t *lbl_light_status;      /* light bar text (reused from old code) */
+static lv_obj_t *lbl_perf;              /* optional FPS/CPU debug bar */
 
 /* ── Screen management ── */
 static lv_obj_t *main_screen = NULL;
@@ -100,7 +98,7 @@ static void lumi_timer_cb(lv_timer_t *timer)
     focus_seconds++;
     daily_seconds++;
 
-    char buf[16];
+    char buf[16], line[64];
     format_time(focus_seconds, buf, sizeof(buf));
     if (!is_camera_view) {
         lv_label_set_text(lbl_focus_time, buf);
@@ -108,7 +106,8 @@ static void lumi_timer_cb(lv_timer_t *timer)
 
     format_time(daily_seconds, buf, sizeof(buf));
     if (!is_camera_view) {
-        lv_label_set_text(lbl_daily_time, buf);
+        snprintf(line, sizeof(line), "today  %s  |  rest", buf);
+        lv_label_set_text(lbl_daily_stats, line);
     }
 }
 
@@ -565,7 +564,23 @@ static void camera_lvgl_update_cb(lv_timer_t *timer)
 }
 
 /*******************************************************************************
- * LumiTrack UI – Main Screen
+ * LumiTrack UI – Main Screen  (4-zone OSD layout for 240×240)
+ * ┌────────────────────┐
+ * │     LumiTrack      │  title
+ * │ ────────────────── │  divider
+ * │ 状态: 自动识别·看书│  Zone1 - status bar
+ * │ ┌─────────────────┐│
+ * │ │   01:28:46      ││  Zone2 - focus timer box
+ * │ │ 专注时长 | 实时  ││
+ * │ └─────────────────┘│
+ * │ 📊 今日 04:12:00   │  Zone3 - daily stats
+ * │ 🏷 看书 学习 ...   │         quick tags
+ * │ ┌─────────────────┐│
+ * │ │💡 关灯|调暗|调亮││  Zone4 - light bar
+ * │ │      |自动       ││
+ * │ └─────────────────┘│
+ * │  30fps  5% CPU     │  optional debug row
+ * └────────────────────┘
  *******************************************************************************/
 static void app_lvgl_display(void)
 {
@@ -574,119 +589,112 @@ static void app_lvgl_display(void)
     lv_obj_t *scr = lv_scr_act();
     main_screen = scr;
 
-    /* Dark background */
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0A1A), 0);
-    lv_obj_set_style_pad_all(scr, 0, 0);
+    lv_obj_set_style_pad_all(scr, 6, 0);          /* 6 px global inset */
 
-    /* ──────────────────────────────────────────────
-     * TITLE: "LumiTrack"
-     * ────────────────────────────────────────────── */
+    /* === Anchor: top bar === */
+    lv_obj_t *prev = NULL;   /* previous widget for relative layout */
+
+    /* ── Title ── */
     lbl_title = lv_label_create(scr);
     lv_label_set_text(lbl_title, "LumiTrack");
     lv_obj_set_style_text_color(lbl_title, lv_color_hex(0x00E5FF), 0);
-    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_20, 0);
-    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_18, 0);
+    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 6);
+    prev = lbl_title;
 
-    /* Divider line under title */
-    lv_obj_t *div1 = lv_obj_create(scr);
-    lv_obj_set_size(div1, 200, 2);
-    lv_obj_set_style_bg_color(div1, lv_color_hex(0x00E5FF), 0);
-    lv_obj_set_style_border_width(div1, 0, 0);
-    lv_obj_set_style_radius(div1, 1, 0);
-    lv_obj_align(div1, LV_ALIGN_TOP_MID, 0, 50);
+    /* ── Divider ── */
+    lv_obj_t *div = lv_obj_create(scr);
+    lv_obj_set_size(div, 210, 1);
+    lv_obj_set_style_bg_color(div, lv_color_hex(0x1A3A4A), 0);
+    lv_obj_set_style_border_width(div, 0, 0);
+    lv_obj_set_style_radius(div, 0, 0);
+    lv_obj_align_to(div, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+    prev = div;
 
-    /* ── Date under divider ── */
-    lbl_date = lv_label_create(scr);
-    lv_label_set_text(lbl_date, "2026-06-22");
-    lv_obj_set_style_text_color(lbl_date, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_set_style_text_font(lbl_date, &lv_font_montserrat_12, 0);
-    lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 60);
+    /* ── Zone 1: Status bar ── */
+    lbl_status_mode = lv_label_create(scr);
+    lv_label_set_text(lbl_status_mode, "auto det: read");
+    lv_obj_set_style_text_color(lbl_status_mode, lv_color_hex(0x33CC99), 0);  /* theme green */
+    lv_obj_set_style_text_font(lbl_status_mode, &lv_font_montserrat_12, 0);
+    lv_obj_align_to(lbl_status_mode, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+    prev = lbl_status_mode;
 
-    /* ──────────────────────────────────────────────
-     * SECTION: 当前状态
-     * ────────────────────────────────────────────── */
-    lbl_status_header = lv_label_create(scr);
-    lv_label_set_text(lbl_status_header, "当前状态");
-    lv_obj_set_style_text_color(lbl_status_header, lv_color_hex(0x8888AA), 0);
-    lv_obj_set_style_text_font(lbl_status_header, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl_status_header, LV_ALIGN_TOP_MID, 0, 75);
+    /* ── Zone 2: Focus timer highlight box ── */
+    lv_obj_t *time_box = lv_obj_create(scr);
+    lv_obj_set_size(time_box, 220, 52);
+    lv_obj_set_style_bg_color(time_box, lv_color_hex(0x102530), 0);           /* dark teal background */
+    lv_obj_set_style_border_color(time_box, lv_color_hex(0x1A5A4A), 0);
+    lv_obj_set_style_border_width(time_box, 1, 0);
+    lv_obj_set_style_radius(time_box, 6, 0);
+    lv_obj_set_style_pad_all(time_box, 4, 0);
+    lv_obj_align_to(time_box, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+    prev = time_box;
 
-    /* Activity icon + text */
-    lbl_activity = lv_label_create(scr);
-    lv_label_set_text(lbl_activity, "[BOOK] 看书");
-    lv_obj_set_style_text_color(lbl_activity, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(lbl_activity, &lv_font_montserrat_20, 0);
-    lv_obj_align(lbl_activity, LV_ALIGN_TOP_MID, 0, 105);
-
-    /* Duration next to activity */
-    lbl_activity_duration = lv_label_create(scr);
-    lv_label_set_text(lbl_activity_duration, "45min");
-    lv_obj_set_style_text_color(lbl_activity_duration, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_set_style_text_font(lbl_activity_duration, &lv_font_montserrat_14, 0);
-    lv_obj_align_to(lbl_activity_duration, lbl_activity, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
-
-    /* ──────────────────────────────────────────────
-     * SECTION: 专注时间
-     * ────────────────────────────────────────────── */
-    /* Subtle separator */
-    lv_obj_t *sep1 = lv_obj_create(scr);
-    lv_obj_set_size(sep1, 160, 1);
-    lv_obj_set_style_bg_color(sep1, lv_color_hex(0x333355), 0);
-    lv_obj_set_style_border_width(sep1, 0, 0);
-    lv_obj_set_style_radius(sep1, 0, 0);
-    lv_obj_align(sep1, LV_ALIGN_TOP_MID, 0, 155);
-
-    lbl_focus_header = lv_label_create(scr);
-    lv_label_set_text(lbl_focus_header, "专注时间");
-    lv_obj_set_style_text_color(lbl_focus_header, lv_color_hex(0x8888AA), 0);
-    lv_obj_set_style_text_font(lbl_focus_header, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl_focus_header, LV_ALIGN_TOP_MID, 0, 180);
-
-    /* Focus timer – large, bold, cyan */
-    lbl_focus_time = lv_label_create(scr);
+    /* Timer value (large) */
+    lbl_focus_time = lv_label_create(time_box);
     lv_label_set_text(lbl_focus_time, "00:00:00");
-    lv_obj_set_style_text_color(lbl_focus_time, lv_color_hex(0x00E5FF), 0);
-    lv_obj_set_style_text_font(lbl_focus_time, &lv_font_montserrat_36, 0);
-    lv_obj_align(lbl_focus_time, LV_ALIGN_TOP_MID, 0, 210);
+    lv_obj_set_style_text_color(lbl_focus_time, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(lbl_focus_time, &lv_font_montserrat_24, 0);
+    lv_obj_align(lbl_focus_time, LV_ALIGN_TOP_LEFT, 4, 4);
 
-    /* ──────────────────────────────────────────────
-     * SECTION: 今日累计
-     * ────────────────────────────────────────────── */
-    lv_obj_t *sep2 = lv_obj_create(scr);
-    lv_obj_set_size(sep2, 160, 1);
-    lv_obj_set_style_bg_color(sep2, lv_color_hex(0x333355), 0);
-    lv_obj_set_style_border_width(sep2, 0, 0);
-    lv_obj_set_style_radius(sep2, 0, 0);
-    lv_obj_align(sep2, LV_ALIGN_TOP_MID, 0, 275);
+    /* Timer description (small, right side) */
+    lbl_focus_desc = lv_label_create(time_box);
+    lv_label_set_text(lbl_focus_desc, "focus  |  live");
+    lv_obj_set_style_text_color(lbl_focus_desc, lv_color_hex(0x668888), 0);
+    lv_obj_set_style_text_font(lbl_focus_desc, &lv_font_montserrat_12, 0);
+    lv_obj_align_to(lbl_focus_desc, lbl_focus_time, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
 
-    lbl_daily_header = lv_label_create(scr);
-    lv_label_set_text(lbl_daily_header, "今日累计");
-    lv_obj_set_style_text_color(lbl_daily_header, lv_color_hex(0x8888AA), 0);
-    lv_obj_set_style_text_font(lbl_daily_header, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl_daily_header, LV_ALIGN_TOP_MID, 0, 300);
+    /* ── Zone 3: Daily stats row ── */
+    lbl_daily_stats = lv_label_create(scr);
+    char init_line[48];
+    snprintf(init_line, sizeof(init_line), "today 04:12:00  |  rest");
+    lv_label_set_text(lbl_daily_stats, init_line);
+    lv_obj_set_style_text_color(lbl_daily_stats, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_font(lbl_daily_stats, &lv_font_montserrat_12, 0);
+    lv_obj_align_to(lbl_daily_stats, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+    prev = lbl_daily_stats;
 
-    /* Daily total – large, white */
-    lbl_daily_time = lv_label_create(scr);
-    char init_daily[16];
-    format_time(daily_seconds, init_daily, sizeof(init_daily));
-    lv_label_set_text(lbl_daily_time, init_daily);
-    lv_obj_set_style_text_color(lbl_daily_time, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(lbl_daily_time, &lv_font_montserrat_36, 0);
-    lv_obj_align(lbl_daily_time, LV_ALIGN_TOP_MID, 0, 330);
+    /* Quick tags row */
+    lbl_quick_tags = lv_label_create(scr);
+    lv_label_set_text(lbl_quick_tags, "read  study  pc  phone");
+    lv_obj_set_style_text_color(lbl_quick_tags, lv_color_hex(0x667777), 0);
+    lv_obj_set_style_text_font(lbl_quick_tags, &lv_font_montserrat_12, 0);
+    lv_obj_align_to(lbl_quick_tags, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
+    prev = lbl_quick_tags;
 
-    /* Light status at bottom */
-    lbl_light_status = lv_label_create(scr);
-    lv_label_set_text(lbl_light_status, "[LIGHT] 自动模式");
-    lv_obj_set_style_text_color(lbl_light_status, lv_color_hex(0xFFFF88), 0);
-    lv_obj_set_style_text_font(lbl_light_status, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl_light_status, LV_ALIGN_BOTTOM_MID, 0, -35);
+    /* ── Separator before light bar ── */
+    lv_obj_t *sep_light = lv_obj_create(scr);
+    lv_obj_set_size(sep_light, 210, 1);
+    lv_obj_set_style_bg_color(sep_light, lv_color_hex(0x1A3A4A), 0);
+    lv_obj_set_style_border_width(sep_light, 0, 0);
+    lv_obj_set_style_radius(sep_light, 0, 0);
+    lv_obj_align_to(sep_light, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+    prev = sep_light;
 
-    /* Bottom branding */
-    lv_obj_t *lbl_brand = lv_label_create(scr);
-    lv_label_set_text(lbl_brand, "LumiTrack v1.0");
-    lv_obj_set_style_text_color(lbl_brand, lv_color_hex(0x444466), 0);
-    lv_obj_set_style_text_font(lbl_brand, &lv_font_montserrat_12, 0);
-    lv_obj_align(lbl_brand, LV_ALIGN_BOTTOM_MID, 0, -15);
+    /* ── Zone 4: Light bar fixed bottom ── */
+    lv_obj_t *light_box = lv_obj_create(scr);
+    lv_obj_set_size(light_box, 220, 28);
+    lv_obj_set_style_bg_color(light_box, lv_color_hex(0x1A1A0A), 0);           /* warm dark */
+    lv_obj_set_style_border_color(light_box, lv_color_hex(0x3A3A1A), 0);
+    lv_obj_set_style_border_width(light_box, 1, 0);
+    lv_obj_set_style_radius(light_box, 6, 0);
+    lv_obj_set_style_pad_all(light_box, 2, 0);
+    lv_obj_align_to(light_box, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+
+    lbl_light_status = lv_label_create(light_box);
+    lv_label_set_text(lbl_light_status, "off  |  dim*  |  bright  |  auto");
+    lv_obj_set_style_text_color(lbl_light_status, lv_color_hex(0xCCAA66), 0);   /* warm amber */
+    lv_obj_set_style_text_font(lbl_light_status, &lv_font_montserrat_12, 0);
+    lv_obj_center(lbl_light_status);
+    prev = light_box;
+
+    /* ── Optional debug row ── */
+    lbl_perf = lv_label_create(scr);
+    lv_label_set_text(lbl_perf, "30fps  5% cpu");
+    lv_obj_set_style_text_color(lbl_perf, lv_color_hex(0x334455), 0);
+    lv_obj_set_style_text_font(lbl_perf, &lv_font_montserrat_10, 0);
+    lv_obj_align_to(lbl_perf, prev, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
 
     bsp_display_unlock();
 }
