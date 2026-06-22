@@ -6,8 +6,9 @@
 
 /**
  * @file
- * @brief LumiTrack - Smart Focus Light UI
+ * @brief LumiTrack - Smart Focus Light UI with camera live view
  * @details Displays current activity status, focus timer, and daily total.
+ *          Press button to toggle between main UI and camera live preview.
  */
 
 #include "esp_log.h"
@@ -18,6 +19,17 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+/* ── Camera (V4L2) ── */
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/param.h>
+#include <linux/videodev2.h>
+#include "esp_video_init.h"
+#include "esp_video_device.h"
+
 #if BSP_CAPS_IMU
 #include "qma6100p.h"
 #endif
@@ -32,12 +44,30 @@ static lv_disp_rotation_t rotation = LV_DISPLAY_ROTATION_0;
 
 /* ── LumiTrack UI Objects ── */
 static lv_obj_t *lbl_title;
+static lv_obj_t *lbl_date;
 static lv_obj_t *lbl_status_header;
 static lv_obj_t *lbl_activity;
+static lv_obj_t *lbl_activity_duration;
 static lv_obj_t *lbl_focus_header;
 static lv_obj_t *lbl_focus_time;
 static lv_obj_t *lbl_daily_header;
 static lv_obj_t *lbl_daily_time;
+static lv_obj_t *lbl_light_status;
+
+/* ── Screen management ── */
+static lv_obj_t *main_screen = NULL;
+static lv_obj_t *camera_screen = NULL;
+static lv_obj_t *cam_img = NULL;
+static bool is_camera_view = false;
+
+/* ── Camera frame buffer ── */
+#define CAM_WIDTH  240
+#define CAM_HEIGHT 240
+static uint8_t *cam_frame_buf[2] = {NULL, NULL};
+static int cam_frame_ready = -1;  /* index of latest ready frame, or -1 */
+static SemaphoreHandle_t cam_frame_mutex = NULL;
+
+static lv_image_dsc_t cam_img_dsc;
 
 /* ── Timer state ── */
 static uint32_t focus_seconds = 0;       /* Current focus session seconds */
@@ -72,10 +102,14 @@ static void lumi_timer_cb(lv_timer_t *timer)
 
     char buf[16];
     format_time(focus_seconds, buf, sizeof(buf));
-    lv_label_set_text(lbl_focus_time, buf);
+    if (!is_camera_view) {
+        lv_label_set_text(lbl_focus_time, buf);
+    }
 
     format_time(daily_seconds, buf, sizeof(buf));
-    lv_label_set_text(lbl_daily_time, buf);
+    if (!is_camera_view) {
+        lv_label_set_text(lbl_daily_time, buf);
+    }
 }
 
 /*******************************************************************************
@@ -98,6 +132,24 @@ static uint16_t app_lvgl_get_rotation_degrees(lv_disp_rotation_t rotation)
 }
 
 #if BSP_CAPS_BUTTONS
+
+/*******************************************************************************
+ * Button callback: toggle between LumiTrack main UI and camera live view
+ *******************************************************************************/
+static void app_hw_btn_toggle_view_cb(void *button_handle, void *usr_data)
+{
+    is_camera_view = !is_camera_view;
+    bsp_display_lock(0);
+    if (is_camera_view) {
+        lv_scr_load_anim(camera_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+        ESP_LOGI(TAG, "Switched to camera live view");
+    } else {
+        lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+        ESP_LOGI(TAG, "Switched to LumiTrack main UI");
+    }
+    bsp_display_unlock();
+}
+
 static void app_hw_btn_rotate_right_cb(void *button_handle, void *usr_data)
 {
     if (rotation == LV_DISPLAY_ROTATION_270) {
@@ -130,18 +182,24 @@ static void app_hw_btn_init(void)
     ESP_LOGI(TAG, "Created %d hardware buttons", btn_cnt);
 
 #if CONFIG_BSP_SELECT_ESP32_S3_EYE
+    /* BSP_BUTTON_1 → toggle between main UI and camera live view */
     if (btn_handles[BSP_BUTTON_1]) {
-        iot_button_register_cb(btn_handles[BSP_BUTTON_1], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_right_cb, NULL);
+        iot_button_register_cb(btn_handles[BSP_BUTTON_1], BUTTON_PRESS_DOWN, NULL, app_hw_btn_toggle_view_cb, NULL);
     }
+    /* BSP_BUTTON_2 → rotate left */
     if (btn_handles[BSP_BUTTON_2]) {
         iot_button_register_cb(btn_handles[BSP_BUTTON_2], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_left_cb, NULL);
     }
+    /* BSP_BUTTON_5 → rotate right */
     if (btn_handles[BSP_BUTTON_5]) {
         iot_button_register_cb(btn_handles[BSP_BUTTON_5], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_right_cb, NULL);
     }
 #else
+    if (btn_cnt >= 1) {
+        /* First button → toggle view */
+        iot_button_register_cb(btn_handles[0], BUTTON_PRESS_DOWN, NULL, app_hw_btn_toggle_view_cb, NULL);
+    }
     if (btn_cnt >= 2) {
-        iot_button_register_cb(btn_handles[0], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_left_cb, NULL);
         iot_button_register_cb(btn_handles[1], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_right_cb, NULL);
     }
 #endif
@@ -286,6 +344,227 @@ static void app_imu_read(void)
 #endif /* BSP_CAPS_IMU */
 
 /*******************************************************************************
+ * Camera DVP init
+ *******************************************************************************/
+static esp_err_t app_camera_init(void)
+{
+    ESP_LOGI(TAG, "Initializing camera (OV2640 via DVP)...");
+
+    /* ESP32-S3-EYE DVP camera pin configuration */
+    static esp_video_init_dvp_config_t dvp_cfg = {
+        .sccb_config = {
+            .init_sccb = true,
+            .i2c_config = {
+                .port = 0,
+                .scl_pin = 5,
+                .sda_pin = 4,
+            },
+            .freq = 100000,
+        },
+        .reset_pin = -1,
+        .pwdn_pin = -1,
+        .dvp_pin = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                11,   /* D0 */
+                9,    /* D1 */
+                8,    /* D2 */
+                10,   /* D3 */
+                12,   /* D4 */
+                18,   /* D5 */
+                17,   /* D6 */
+                16,   /* D7 */
+            },
+            .vsync_io = 6,
+            .de_io = 7,
+            .pclk_io = 13,
+            .xclk_io = 15,
+        },
+        .xclk_freq = 20000000,  /* 20 MHz */
+    };
+
+    static const esp_video_init_config_t video_config = {
+        .dvp = &dvp_cfg,
+    };
+
+    esp_err_t ret = esp_video_init(&video_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed: %d", ret);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Camera initialized successfully");
+    return ESP_OK;
+}
+
+/*******************************************************************************
+ * Camera capture task (runs in separate FreeRTOS task)
+ * Uses V4L2 API to capture frames from DVP video device /dev/video2
+ *******************************************************************************/
+static void camera_capture_task(void *arg)
+{
+    ESP_LOGI(TAG, "Camera capture task started");
+
+    const char *dev_path = ESP_VIDEO_DVP_DEVICE_NAME; /* "/dev/video2" */
+    const int buf_count = 2;
+    uint8_t *v4l2_bufs[buf_count];
+
+    int fd = open(dev_path, O_RDONLY);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "Failed to open %s", dev_path);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* ── Set format: RGB565, 240x240 ── */
+    struct v4l2_format fmt = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .fmt.pix.width = CAM_WIDTH,
+        .fmt.pix.height = CAM_HEIGHT,
+        .fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565,
+    };
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
+        ESP_LOGE(TAG, "Failed to set format, trying JPEG...");
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+        if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
+            ESP_LOGE(TAG, "Failed to set any format");
+            close(fd);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "Camera format: %" PRIu32 "x%" PRIu32 " pixfmt=0x%08" PRIx32,
+             fmt.fmt.pix.width, fmt.fmt.pix.height,
+             fmt.fmt.pix.pixelformat);
+
+    /* ── Request MMAP buffers ── */
+    struct v4l2_requestbuffers req = {
+        .count = buf_count,
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0) {
+        ESP_LOGE(TAG, "Failed to request buffers");
+        close(fd);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    for (int i = 0; i < buf_count; i++) {
+        struct v4l2_buffer buf = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+            .index = i,
+        };
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "Failed to query buffer %d", i);
+            close(fd);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        v4l2_bufs[i] = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, fd, buf.m.offset);
+        if (v4l2_bufs[i] == MAP_FAILED) {
+            ESP_LOGE(TAG, "Failed to mmap buffer %d", i);
+            close(fd);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "Failed to queue buffer %d", i);
+            close(fd);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    /* ── Start streaming ── */
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "Failed to start stream");
+        close(fd);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "Camera stream started");
+
+    int frame_index = 0;
+
+    /* ── Capture loop ── */
+    while (1) {
+        struct v4l2_buffer buf = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+        };
+
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "DQBUF failed");
+            break;
+        }
+
+        if (buf.flags & V4L2_BUF_FLAG_DONE && buf.bytesused > 0) {
+            /* Copy frame data into display buffer */
+            int dst = frame_index % 2;
+            size_t copy_len = buf.bytesused;
+            if (copy_len > CAM_WIDTH * CAM_HEIGHT * 2) {
+                copy_len = CAM_WIDTH * CAM_HEIGHT * 2;
+            }
+
+            if (xSemaphoreTake(cam_frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (cam_frame_buf[dst]) {
+                    memcpy(cam_frame_buf[dst], v4l2_bufs[buf.index], copy_len);
+                    cam_frame_ready = dst;
+                }
+                xSemaphoreGive(cam_frame_mutex);
+            }
+
+            frame_index++;
+        }
+
+        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "QBUF failed");
+            break;
+        }
+    }
+
+    /* Cleanup (unreachable in normal operation but kept for completeness) */
+    ioctl(fd, VIDIOC_STREAMOFF, &type);
+    close(fd);
+    ESP_LOGW(TAG, "Camera capture task exiting");
+    vTaskDelete(NULL);
+}
+
+/*******************************************************************************
+ * LVGL timer: refresh camera image on screen (runs every ~50ms = ~20fps)
+ *******************************************************************************/
+static void camera_lvgl_update_cb(lv_timer_t *timer)
+{
+    if (!is_camera_view || !cam_img) {
+        return;
+    }
+
+    int ready_idx = -1;
+    if (xSemaphoreTake(cam_frame_mutex, 0) == pdTRUE) {
+        ready_idx = cam_frame_ready;
+        if (ready_idx >= 0) {
+            cam_frame_ready = -1;
+        }
+        xSemaphoreGive(cam_frame_mutex);
+    }
+
+    if (ready_idx >= 0 && cam_frame_buf[ready_idx]) {
+        bsp_display_lock(0);
+        cam_img_dsc.data = cam_frame_buf[ready_idx];
+        /* Re-set source to trigger LVGL to re-decode/render the new frame */
+        lv_image_set_src(cam_img, &cam_img_dsc);
+        lv_obj_invalidate(cam_img);
+        bsp_display_unlock();
+    }
+}
+
+/*******************************************************************************
  * LumiTrack UI – Main Screen
  *******************************************************************************/
 static void app_lvgl_display(void)
@@ -293,6 +572,7 @@ static void app_lvgl_display(void)
     bsp_display_lock(0);
 
     lv_obj_t *scr = lv_scr_act();
+    main_screen = scr;
 
     /* Dark background */
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0A1A), 0);
@@ -315,6 +595,13 @@ static void app_lvgl_display(void)
     lv_obj_set_style_radius(div1, 1, 0);
     lv_obj_align(div1, LV_ALIGN_TOP_MID, 0, 50);
 
+    /* ── Date under divider ── */
+    lbl_date = lv_label_create(scr);
+    lv_label_set_text(lbl_date, "2026-06-22");
+    lv_obj_set_style_text_color(lbl_date, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_font(lbl_date, &lv_font_montserrat_12, 0);
+    lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 60);
+
     /* ──────────────────────────────────────────────
      * SECTION: 当前状态
      * ────────────────────────────────────────────── */
@@ -328,8 +615,15 @@ static void app_lvgl_display(void)
     lbl_activity = lv_label_create(scr);
     lv_label_set_text(lbl_activity, "[BOOK] 看书");
     lv_obj_set_style_text_color(lbl_activity, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(lbl_activity, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_font(lbl_activity, &lv_font_montserrat_20, 0);
     lv_obj_align(lbl_activity, LV_ALIGN_TOP_MID, 0, 105);
+
+    /* Duration next to activity */
+    lbl_activity_duration = lv_label_create(scr);
+    lv_label_set_text(lbl_activity_duration, "45min");
+    lv_obj_set_style_text_color(lbl_activity_duration, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_font(lbl_activity_duration, &lv_font_montserrat_14, 0);
+    lv_obj_align_to(lbl_activity_duration, lbl_activity, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
 
     /* ──────────────────────────────────────────────
      * SECTION: 专注时间
@@ -380,12 +674,51 @@ static void app_lvgl_display(void)
     lv_obj_set_style_text_font(lbl_daily_time, &lv_font_montserrat_36, 0);
     lv_obj_align(lbl_daily_time, LV_ALIGN_TOP_MID, 0, 330);
 
+    /* Light status at bottom */
+    lbl_light_status = lv_label_create(scr);
+    lv_label_set_text(lbl_light_status, "[LIGHT] 自动模式");
+    lv_obj_set_style_text_color(lbl_light_status, lv_color_hex(0xFFFF88), 0);
+    lv_obj_set_style_text_font(lbl_light_status, &lv_font_montserrat_14, 0);
+    lv_obj_align(lbl_light_status, LV_ALIGN_BOTTOM_MID, 0, -35);
+
     /* Bottom branding */
     lv_obj_t *lbl_brand = lv_label_create(scr);
     lv_label_set_text(lbl_brand, "LumiTrack v1.0");
     lv_obj_set_style_text_color(lbl_brand, lv_color_hex(0x444466), 0);
     lv_obj_set_style_text_font(lbl_brand, &lv_font_montserrat_12, 0);
     lv_obj_align(lbl_brand, LV_ALIGN_BOTTOM_MID, 0, -15);
+
+    bsp_display_unlock();
+}
+
+/*******************************************************************************
+ * Camera UI – Full-screen live preview screen
+ *******************************************************************************/
+static void app_camera_lvgl_screen(void)
+{
+    bsp_display_lock(0);
+
+    camera_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(camera_screen, lv_color_black(), 0);
+    lv_obj_set_style_pad_all(camera_screen, 0, 0);
+
+    /* Full-screen camera image */
+    cam_img = lv_image_create(camera_screen);
+    lv_obj_set_size(cam_img, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(cam_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_pad_all(cam_img, 0, 0);
+    lv_obj_set_style_border_width(cam_img, 0, 0);
+
+    /* Set the initial empty image source */
+    lv_image_set_src(cam_img, &cam_img_dsc);
+
+    /* Hint text overlay (shown when no frame yet) */
+    lv_obj_t *hint = lv_label_create(camera_screen);
+    lv_label_set_text(hint, "Camera Starting...");
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(hint, LV_OBJ_FLAG_FLOATING);
 
     bsp_display_unlock();
 }
@@ -412,23 +745,51 @@ void app_main(void)
     /* Create LumiTrack UI */
     app_lvgl_display();
 
+    /* Create camera screen (hidden initially) */
+    app_camera_lvgl_screen();
+
+    /* Initialize camera frame buffers for LVGL display */
+    cam_frame_buf[0] = heap_caps_malloc(CAM_WIDTH * CAM_HEIGHT * 2,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    cam_frame_buf[1] = heap_caps_malloc(CAM_WIDTH * CAM_HEIGHT * 2,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    cam_frame_mutex = xSemaphoreCreateBinary();
+    xSemaphoreGive(cam_frame_mutex);  /* Give initial token so first take succeeds */
+
+    /* Setup camera image descriptor */
+    cam_img_dsc.header.w = CAM_WIDTH;
+    cam_img_dsc.header.h = CAM_HEIGHT;
+    cam_img_dsc.header.stride = CAM_WIDTH * 2;
+    cam_img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    cam_img_dsc.data = cam_frame_buf[0];
+    cam_img_dsc.data_size = CAM_WIDTH * CAM_HEIGHT * 2;
+
+    /* Initialize camera hardware */
+    esp_err_t cam_err = app_camera_init();
+    if (cam_err == ESP_OK) {
+        /* Start camera capture task */
+        xTaskCreatePinnedToCore(camera_capture_task, "cam_cap", 4096, NULL, 5,
+                                NULL, 1);  /* Run on core 1 */
+    } else {
+        ESP_LOGE(TAG, "Camera init failed, camera view will show black screen");
+    }
+
     /* Create 1-second timer to update focus & daily counters */
     lv_timer_create(lumi_timer_cb, 1000, NULL);
 
-    ESP_LOGI(TAG, "LumiTrack UI initialized.");
+    /* Create 50ms timer to refresh camera image on display */
+    lv_timer_create(camera_lvgl_update_cb, 50, NULL);
+
+    ESP_LOGI(TAG, "LumiTrack UI initialized. Press [BTN1] to toggle camera view.");
 
 #if BSP_CAPS_IMU
     while (1) {
         app_imu_read();
-        vTaskDelay(pdMS_TO_TICKS(40));
-    }
-#elif BSP_CAPS_BUTTONS
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        lv_timer_handler();
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 #else
     while (1) {
-        /* Let LVGL timer handle UI updates; just keep the task alive */
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
