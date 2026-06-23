@@ -1,0 +1,36 @@
+# ESP-IDF build output
+build/
+
+# Sdkconfig generated files (keep defaults only)
+sdkconfig
+sdkconfig.old
+sdkconfig.bsp.*
+
+# Dependencies lock
+dependencies.lock
+
+# Managed components
+managed_components/
+
+# IDE / Editor
+.vscode/
+.vscode/*
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# CMake generated
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt

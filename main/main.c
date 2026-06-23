@@ -55,8 +55,22 @@ static lv_obj_t *lbl_perf;              /* optional FPS/CPU debug bar */
 /* ── Screen management ── */
 static lv_obj_t *main_screen = NULL;
 static lv_obj_t *camera_screen = NULL;
+static lv_obj_t *settings_screen = NULL;
 static lv_obj_t *cam_img = NULL;
 static bool is_camera_view = false;
+static bool is_settings_view = false;
+
+/* ── Settings menu ── */
+#define SETTINGS_MENU_COUNT 5
+static const char *settings_menu_items[SETTINGS_MENU_COUNT] = {
+    "自定义行为标签",
+    "自动识别传感器",
+    "屏幕亮度调节",
+    "本地数据导出",
+    "设备恢复出厂"
+};
+static int settings_menu_index = 0;
+static lv_obj_t *settings_menu_list = NULL;
 
 /* ── Camera frame buffer ── */
 #define CAM_WIDTH  240
@@ -137,16 +151,99 @@ static uint16_t app_lvgl_get_rotation_degrees(lv_disp_rotation_t rotation)
  *******************************************************************************/
 static void app_hw_btn_toggle_view_cb(void *button_handle, void *usr_data)
 {
-    is_camera_view = !is_camera_view;
-    bsp_display_lock(0);
-    if (is_camera_view) {
-        lv_scr_load_anim(camera_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
-        ESP_LOGI(TAG, "Switched to camera live view");
-    } else {
+    if (is_settings_view) {
+        /* Exit settings mode */
+        is_settings_view = false;
+        bsp_display_lock(0);
         lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
-        ESP_LOGI(TAG, "Switched to LumiTrack main UI");
+        ESP_LOGI(TAG, "Exited settings mode");
+        bsp_display_unlock();
+        return;
+    }
+
+    if (is_camera_view) {
+        /* Go to settings from camera view */
+        is_camera_view = false;
+        is_settings_view = true;
+        bsp_display_lock(0);
+        lv_scr_load_anim(settings_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+        ESP_LOGI(TAG, "Switched to settings view");
+        bsp_display_unlock();
+    } else {
+        /* Toggle between main UI and camera view */
+        is_camera_view = !is_camera_view;
+        bsp_display_lock(0);
+        if (is_camera_view) {
+            lv_scr_load_anim(camera_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+            ESP_LOGI(TAG, "Switched to camera live view");
+        } else {
+            lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+            ESP_LOGI(TAG, "Switched to LumiTrack main UI");
+        }
+        bsp_display_unlock();
+    }
+}
+
+static void app_hw_btn_settings_up_cb(void *button_handle, void *usr_data)
+{
+    if (!is_settings_view) return;
+
+    settings_menu_index--;
+    if (settings_menu_index < 0) {
+        settings_menu_index = SETTINGS_MENU_COUNT - 1;
+    }
+    bsp_display_lock(0);
+    /* Update selection highlight */
+    for (int i = 0; i < SETTINGS_MENU_COUNT; i++) {
+        lv_obj_t *item = lv_obj_get_child(settings_menu_list, i);
+        if (item) {
+            lv_obj_t *label = lv_obj_get_child(item, 0);
+            if (label) {
+                if (i == settings_menu_index) {
+                    lv_obj_set_style_text_color(label, lv_color_hex(0x00E5FF), 0);
+                } else {
+                    lv_obj_set_style_text_color(label, lv_color_hex(0xAAAAAA), 0);
+                }
+            }
+        }
     }
     bsp_display_unlock();
+    ESP_LOGI(TAG, "Settings menu up: index=%d", settings_menu_index);
+}
+
+static void app_hw_btn_settings_down_cb(void *button_handle, void *usr_data)
+{
+    if (!is_settings_view) return;
+
+    settings_menu_index++;
+    if (settings_menu_index >= SETTINGS_MENU_COUNT) {
+        settings_menu_index = 0;
+    }
+    bsp_display_lock(0);
+    /* Update selection highlight */
+    for (int i = 0; i < SETTINGS_MENU_COUNT; i++) {
+        lv_obj_t *item = lv_obj_get_child(settings_menu_list, i);
+        if (item) {
+            lv_obj_t *label = lv_obj_get_child(item, 0);
+            if (label) {
+                if (i == settings_menu_index) {
+                    lv_obj_set_style_text_color(label, lv_color_hex(0x00E5FF), 0);
+                } else {
+                    lv_obj_set_style_text_color(label, lv_color_hex(0xAAAAAA), 0);
+                }
+            }
+        }
+    }
+    bsp_display_unlock();
+    ESP_LOGI(TAG, "Settings menu down: index=%d", settings_menu_index);
+}
+
+static void app_hw_btn_settings_confirm_cb(void *button_handle, void *usr_data)
+{
+    if (!is_settings_view) return;
+
+    ESP_LOGI(TAG, "Settings confirm: %s", settings_menu_items[settings_menu_index]);
+    /* TODO: Enter sub-page for selected item */
 }
 
 static void app_hw_btn_rotate_right_cb(void *button_handle, void *usr_data)
@@ -181,25 +278,32 @@ static void app_hw_btn_init(void)
     ESP_LOGI(TAG, "Created %d hardware buttons", btn_cnt);
 
 #if CONFIG_BSP_SELECT_ESP32_S3_EYE
-    /* BSP_BUTTON_1 → toggle between main UI and camera live view */
+    /* BSP_BUTTON_1 → toggle view / enter settings */
     if (btn_handles[BSP_BUTTON_1]) {
         iot_button_register_cb(btn_handles[BSP_BUTTON_1], BUTTON_PRESS_DOWN, NULL, app_hw_btn_toggle_view_cb, NULL);
     }
-    /* BSP_BUTTON_2 → rotate left */
+    /* BSP_BUTTON_2 → rotate left / settings up */
     if (btn_handles[BSP_BUTTON_2]) {
         iot_button_register_cb(btn_handles[BSP_BUTTON_2], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_left_cb, NULL);
+        iot_button_register_cb(btn_handles[BSP_BUTTON_2], BUTTON_LONG_PRESS_START, NULL, app_hw_btn_settings_up_cb, NULL);
     }
-    /* BSP_BUTTON_5 → rotate right */
+    /* BSP_BUTTON_5 → rotate right / settings down */
     if (btn_handles[BSP_BUTTON_5]) {
         iot_button_register_cb(btn_handles[BSP_BUTTON_5], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_right_cb, NULL);
+        iot_button_register_cb(btn_handles[BSP_BUTTON_5], BUTTON_LONG_PRESS_START, NULL, app_hw_btn_settings_down_cb, NULL);
     }
+    /* Additional button for confirm in settings (using short press of btn2 in settings mode) */
 #else
     if (btn_cnt >= 1) {
-        /* First button → toggle view */
         iot_button_register_cb(btn_handles[0], BUTTON_PRESS_DOWN, NULL, app_hw_btn_toggle_view_cb, NULL);
+        iot_button_register_cb(btn_handles[0], BUTTON_LONG_PRESS_START, NULL, app_hw_btn_settings_confirm_cb, NULL);
     }
     if (btn_cnt >= 2) {
         iot_button_register_cb(btn_handles[1], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_right_cb, NULL);
+        iot_button_register_cb(btn_handles[1], BUTTON_LONG_PRESS_START, NULL, app_hw_btn_settings_down_cb, NULL);
+    }
+    if (btn_cnt >= 3) {
+        iot_button_register_cb(btn_handles[2], BUTTON_PRESS_DOWN, NULL, app_hw_btn_settings_up_cb, NULL);
     }
 #endif
 }
@@ -732,6 +836,110 @@ static void app_camera_lvgl_screen(void)
 }
 
 /*******************************************************************************
+ * Settings UI – Device Settings Screen
+ * ┌─────────────────────────────┐
+ * │         设备设置            │
+ * │                             │
+ * │ ▶ 自定义行为标签（新增/删除）│
+ * │ ▶ 自动识别传感器开关        │
+ * │ ▶ 屏幕亮度调节              │
+ * │ ▶ 本地数据导出              │
+ * │ ▶ 设备恢复出厂              │
+ * │                             │
+ * │ 上下选菜单，确认进入子页面   │
+ * │                             │
+ * ├─────────────────────────────┤
+ * │ ○关灯  ◎调暗  ●调亮         │
+ * └─────────────────────────────┘
+ *******************************************************************************/
+static void app_settings_lvgl_screen(void)
+{
+    bsp_display_lock(0);
+
+    settings_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(settings_screen, lv_color_hex(0x0A0A1A), 0);
+    lv_obj_set_style_pad_all(settings_screen, 6, 0);
+
+    /* ── Title ── */
+    lv_obj_t *title = lv_label_create(settings_screen);
+    lv_label_set_text(title, "设备设置");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* ── Divider ── */
+    lv_obj_t *div = lv_obj_create(settings_screen);
+    lv_obj_set_size(div, 210, 1);
+    lv_obj_set_style_bg_color(div, lv_color_hex(0x1A3A4A), 0);
+    lv_obj_set_style_border_width(div, 0, 0);
+    lv_obj_set_style_radius(div, 0, 0);
+    lv_obj_align_to(div, title, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    /* ── Settings menu list ── */
+    settings_menu_list = lv_obj_create(settings_screen);
+    lv_obj_set_size(settings_menu_list, 220, 120);
+    lv_obj_set_style_bg_color(settings_menu_list, lv_color_hex(0x102530), 0);
+    lv_obj_set_style_border_color(settings_menu_list, lv_color_hex(0x1A5A4A), 0);
+    lv_obj_set_style_border_width(settings_menu_list, 1, 0);
+    lv_obj_set_style_radius(settings_menu_list, 6, 0);
+    lv_obj_set_style_pad_all(settings_menu_list, 4, 0);
+    lv_obj_set_flex_flow(settings_menu_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(settings_menu_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_align_to(settings_menu_list, div, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    /* Create menu items */
+    for (int i = 0; i < SETTINGS_MENU_COUNT; i++) {
+        lv_obj_t *item = lv_obj_create(settings_menu_list);
+        lv_obj_set_size(item, LV_PCT(100), 22);
+        lv_obj_set_style_bg_color(item, lv_color_hex(0x00000000), 0);
+        lv_obj_set_style_border_width(item, 0, 0);
+        lv_obj_set_style_pad_all(item, 0, 0);
+
+        lv_obj_t *label = lv_label_create(item);
+        lv_label_set_text(label, settings_menu_items[i]);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_center(label);
+    }
+
+    /* Highlight current selection */
+    {
+        lv_obj_t *first_item = lv_obj_get_child(settings_menu_list, 0);
+        if (first_item) {
+            lv_obj_t *first_label = lv_obj_get_child(first_item, 0);
+            if (first_label) {
+                lv_obj_set_style_text_color(first_label, lv_color_hex(0x00E5FF), 0);
+            }
+        }
+    }
+
+    /* ── Instruction text ── */
+    lv_obj_t *instruction = lv_label_create(settings_screen);
+    lv_label_set_text(instruction, "上下选菜单，确认进入子页面");
+    lv_obj_set_style_text_color(instruction, lv_color_hex(0x667777), 0);
+    lv_obj_set_style_text_font(instruction, &lv_font_montserrat_10, 0);
+    lv_obj_align_to(instruction, settings_menu_list, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+
+    /* ── Light control bar at bottom ── */
+    lv_obj_t *light_bar = lv_obj_create(settings_screen);
+    lv_obj_set_size(light_bar, 220, 30);
+    lv_obj_set_style_bg_color(light_bar, lv_color_hex(0x1A1A0A), 0);
+    lv_obj_set_style_border_color(light_bar, lv_color_hex(0x3A3A1A), 0);
+    lv_obj_set_style_border_width(light_bar, 1, 0);
+    lv_obj_set_style_radius(light_bar, 6, 0);
+    lv_obj_set_style_pad_all(light_bar, 2, 0);
+    lv_obj_align_to(light_bar, instruction, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    lv_obj_t *light_label = lv_label_create(light_bar);
+    lv_label_set_text(light_label, "○关灯  ◎调暗  ●调亮");
+    lv_obj_set_style_text_color(light_label, lv_color_hex(0xCCAA66), 0);
+    lv_obj_set_style_text_font(light_label, &lv_font_montserrat_11, 0);
+    lv_obj_center(light_label);
+
+    bsp_display_unlock();
+}
+
+/*******************************************************************************
  * app_main
  *******************************************************************************/
 void app_main(void)
@@ -755,6 +963,9 @@ void app_main(void)
 
     /* Create camera screen (hidden initially) */
     app_camera_lvgl_screen();
+
+    /* Create settings screen (hidden initially) */
+    app_settings_lvgl_screen();
 
     /* Initialize camera frame buffers for LVGL display */
     cam_frame_buf[0] = heap_caps_malloc(CAM_WIDTH * CAM_HEIGHT * 2,

@@ -1,0 +1,6 @@
+description: BSP Display rotation example
+
+dependencies:
+  bsp_selector:
+    version: '*'
+    override_path: ../../esp-bsp-master/components/bsp_selector
