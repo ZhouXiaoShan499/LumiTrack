@@ -29,6 +29,27 @@
 #include <linux/videodev2.h>
 #include "esp_video_init.h"
 #include "esp_video_device.h"
+#include "esp_spiffs.h"
+#include "esp_vfs_fat.h"
+#include <sys/stat.h>
+#include <time.h>
+
+/* ── SD Card ── */
+#include "driver/sdmmc_host.h"
+#include "driver/sdmmc_defs.h"
+#include "sdmmc_cmd.h"
+#include "diskio_impl.h"
+#include "vfs_fat_internal.h"
+
+/* ── SD Card Pin Configuration for ESP32-S3-EYE ──
+ * Based on ESP32-S3-EYE schematic (SDMMC 1-bit mode):
+ *   CLK: GPIO39,  CMD: GPIO38,  D0: GPIO40,  D3: GPIO13
+ * D3 must be pulled high even in 1-bit mode.
+ */
+#define SD_CMD_PIN  GPIO_NUM_38  /* SDMMC CMD */
+#define SD_CLK_PIN  GPIO_NUM_39  /* SDMMC CLK */
+#define SD_D0_PIN   GPIO_NUM_40  /* SDMMC D0  */
+#define SD_D3_PIN   GPIO_NUM_13  /* SDMMC D3  (pull-up required) */
 
 #if BSP_CAPS_IMU
 #include "qma6100p.h"
@@ -40,7 +61,7 @@
 static const char *TAG = "LumiTrack";
 
 static lv_disp_t *display;
-static lv_disp_rotation_t rotation = LV_DISPLAY_ROTATION_0;
+static lv_disp_rotation_t __attribute__((unused)) rotation = LV_DISPLAY_ROTATION_0;
 
 /* ── LumiTrack UI Objects ── */
 static lv_obj_t *lbl_title;
@@ -60,14 +81,28 @@ static lv_obj_t *cam_img = NULL;
 static bool is_camera_view = false;
 static bool is_settings_view = false;
 
+/* ── Pending actions (deferred from button ISR/timer context) ── */
+typedef enum {
+    PENDING_NONE = 0,
+    PENDING_TOGGLE_VIEW,
+    PENDING_ROTATE_LEFT,            // 屏幕旋转按钮已禁用
+    PENDING_ROTATE_RIGHT,           // 屏幕旋转按钮已禁用
+    PENDING_SETTINGS_UP,
+    PENDING_SETTINGS_DOWN,
+    PENDING_SETTINGS_CONFIRM,
+    PENDING_CAPTURE,
+} pending_action_t;
+static volatile pending_action_t pending_action = PENDING_NONE;
+
 /* ── Settings menu ── */
-#define SETTINGS_MENU_COUNT 5
+#define SETTINGS_MENU_COUNT 6
 static const char *settings_menu_items[SETTINGS_MENU_COUNT] = {
-    "自定义行为标签",
-    "自动识别传感器",
-    "屏幕亮度调节",
-    "本地数据导出",
-    "设备恢复出厂"
+    "Capture Photo",
+    "Custom Tags",
+    "Sensor Auto-Detect",
+    "Brightness",
+    "Export Data",
+    "Factory Reset"
 };
 static int settings_menu_index = 0;
 static lv_obj_t *settings_menu_list = NULL;
@@ -80,6 +115,19 @@ static int cam_frame_ready = -1;  /* index of latest ready frame, or -1 */
 static SemaphoreHandle_t cam_frame_mutex = NULL;
 
 static lv_image_dsc_t cam_img_dsc;
+
+/* ── Photo capture ── */
+static volatile bool capture_requested = false;
+static lv_obj_t *toast_label = NULL;
+
+/* ── SD Card & Auto-capture ── */
+static sdmmc_card_t *sd_card = NULL;
+static bool sd_mounted = false;
+static uint32_t auto_capture_interval_s = 5;  /* seconds between auto captures */
+static uint32_t auto_capture_count = 0;       /* total auto-captured frames */
+static volatile bool auto_capture_enabled = true;
+static lv_obj_t *rec_label = NULL;            /* "● REC" overlay on camera view */
+static lv_timer_t *rec_blink_timer = NULL;    /* timer for blinking red dot */
 
 /* ── Timer state ── */
 static uint32_t focus_seconds = 0;       /* Current focus session seconds */
@@ -129,7 +177,7 @@ static void lumi_timer_cb(lv_timer_t *timer)
  * Private functions – Button & IMU (kept for hardware compatibility)
  *******************************************************************************/
 
-static uint16_t app_lvgl_get_rotation_degrees(lv_disp_rotation_t rotation)
+static uint16_t __attribute__((unused)) app_lvgl_get_rotation_degrees(lv_disp_rotation_t rotation)
 {
     switch (rotation) {
     case LV_DISPLAY_ROTATION_0:
@@ -146,130 +194,159 @@ static uint16_t app_lvgl_get_rotation_degrees(lv_disp_rotation_t rotation)
 
 #if BSP_CAPS_BUTTONS
 
+/* Forward declaration for photo capture (defined later in SPIFFS section) */
+void app_photo_capture(void);
+
 /*******************************************************************************
- * Button callback: toggle between LumiTrack main UI and camera live view
+ * Photo capture handler – called from main loop when capture is requested
  *******************************************************************************/
-static void app_hw_btn_toggle_view_cb(void *button_handle, void *usr_data)
+static void app_photo_capture_handler(void)
 {
-    if (is_settings_view) {
-        /* Exit settings mode */
-        is_settings_view = false;
-        bsp_display_lock(0);
-        lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
-        ESP_LOGI(TAG, "Exited settings mode");
-        bsp_display_unlock();
+    if (capture_requested) {
+        capture_requested = false;
+        app_photo_capture();
+    }
+}
+
+/*******************************************************************************
+ * Pending action processor – executed in main loop (LVGL task context)
+ *******************************************************************************/
+static void app_process_pending_action(void)
+{
+    pending_action_t action = pending_action;
+    if (action == PENDING_NONE) return;
+    pending_action = PENDING_NONE;
+
+    if (!bsp_display_lock(pdMS_TO_TICKS(200))) {
+        /* If lock fails, re-queue for next loop iteration */
+        pending_action = action;
         return;
     }
 
-    if (is_camera_view) {
-        /* Go to settings from camera view */
-        is_camera_view = false;
-        is_settings_view = true;
-        bsp_display_lock(0);
-        lv_scr_load_anim(settings_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
-        ESP_LOGI(TAG, "Switched to settings view");
-        bsp_display_unlock();
-    } else {
-        /* Toggle between main UI and camera view */
-        is_camera_view = !is_camera_view;
-        bsp_display_lock(0);
-        if (is_camera_view) {
+    switch (action) {
+    case PENDING_TOGGLE_VIEW:
+        if (is_settings_view) {
+            is_settings_view = false;
+            is_camera_view = true;
             lv_scr_load_anim(camera_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
             ESP_LOGI(TAG, "Switched to camera live view");
-        } else {
+        } else if (is_camera_view) {
+            is_camera_view = false;
             lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
             ESP_LOGI(TAG, "Switched to LumiTrack main UI");
+        } else {
+            is_settings_view = true;
+            lv_scr_load_anim(settings_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+            ESP_LOGI(TAG, "Switched to settings view");
         }
-        bsp_display_unlock();
+        break;
+
+    // case PENDING_ROTATE_LEFT:        // 屏幕旋转按钮已禁用
+    //     if (rotation == LV_DISPLAY_ROTATION_0) {
+    //         rotation = LV_DISPLAY_ROTATION_270;
+    //     } else {
+    //         rotation--;
+    //     }
+    //     bsp_display_rotate(display, rotation);
+    //     ESP_LOGI(TAG, "Button rotate left – Rotation: %d", app_lvgl_get_rotation_degrees(rotation));
+    //     break;
+
+    // case PENDING_ROTATE_RIGHT:       // 屏幕旋转按钮已禁用
+    //     if (rotation == LV_DISPLAY_ROTATION_270) {
+    //         rotation = LV_DISPLAY_ROTATION_0;
+    //     } else {
+    //         rotation++;
+    //     }
+    //     bsp_display_rotate(display, rotation);
+    //     ESP_LOGI(TAG, "Button rotate right – Rotation: %d", app_lvgl_get_rotation_degrees(rotation));
+    //     break;
+
+    case PENDING_SETTINGS_UP:
+        if (!is_settings_view) break;
+        settings_menu_index--;
+        if (settings_menu_index < 0) {
+            settings_menu_index = SETTINGS_MENU_COUNT - 1;
+        }
+        for (int i = 0; i < SETTINGS_MENU_COUNT; i++) {
+            lv_obj_t *item = lv_obj_get_child(settings_menu_list, i);
+            if (item) {
+                lv_obj_t *label = lv_obj_get_child(item, 0);
+                if (label) {
+                    lv_obj_set_style_text_color(label,
+                        (i == settings_menu_index) ? lv_color_hex(0x00E5FF) : lv_color_hex(0xAAAAAA), 0);
+                }
+            }
+        }
+        ESP_LOGI(TAG, "Settings menu up: index=%d", settings_menu_index);
+        break;
+
+    case PENDING_SETTINGS_DOWN:
+        if (!is_settings_view) break;
+        settings_menu_index++;
+        if (settings_menu_index >= SETTINGS_MENU_COUNT) {
+            settings_menu_index = 0;
+        }
+        for (int i = 0; i < SETTINGS_MENU_COUNT; i++) {
+            lv_obj_t *item = lv_obj_get_child(settings_menu_list, i);
+            if (item) {
+                lv_obj_t *label = lv_obj_get_child(item, 0);
+                if (label) {
+                    lv_obj_set_style_text_color(label,
+                        (i == settings_menu_index) ? lv_color_hex(0x00E5FF) : lv_color_hex(0xAAAAAA), 0);
+                }
+            }
+        }
+        ESP_LOGI(TAG, "Settings menu down: index=%d", settings_menu_index);
+        break;
+
+    case PENDING_SETTINGS_CONFIRM:
+        if (is_settings_view) {
+            ESP_LOGI(TAG, "Settings confirm: %s", settings_menu_items[settings_menu_index]);
+            if (settings_menu_index == 0) {
+                /* "Capture Photo" */
+                capture_requested = true;
+            }
+        }
+        break;
+
+    default:
+        break;
     }
+
+    bsp_display_unlock();
+}
+
+/*******************************************************************************
+ * Button callbacks – lightweight, only set pending flag (ISR/timer safe)
+ *******************************************************************************/
+static void app_hw_btn_toggle_view_cb(void *button_handle, void *usr_data)
+{
+    pending_action = PENDING_TOGGLE_VIEW;
 }
 
 static void app_hw_btn_settings_up_cb(void *button_handle, void *usr_data)
 {
-    if (!is_settings_view) return;
-
-    settings_menu_index--;
-    if (settings_menu_index < 0) {
-        settings_menu_index = SETTINGS_MENU_COUNT - 1;
-    }
-    bsp_display_lock(0);
-    /* Update selection highlight */
-    for (int i = 0; i < SETTINGS_MENU_COUNT; i++) {
-        lv_obj_t *item = lv_obj_get_child(settings_menu_list, i);
-        if (item) {
-            lv_obj_t *label = lv_obj_get_child(item, 0);
-            if (label) {
-                if (i == settings_menu_index) {
-                    lv_obj_set_style_text_color(label, lv_color_hex(0x00E5FF), 0);
-                } else {
-                    lv_obj_set_style_text_color(label, lv_color_hex(0xAAAAAA), 0);
-                }
-            }
-        }
-    }
-    bsp_display_unlock();
-    ESP_LOGI(TAG, "Settings menu up: index=%d", settings_menu_index);
+    pending_action = PENDING_SETTINGS_UP;
 }
 
 static void app_hw_btn_settings_down_cb(void *button_handle, void *usr_data)
 {
-    if (!is_settings_view) return;
-
-    settings_menu_index++;
-    if (settings_menu_index >= SETTINGS_MENU_COUNT) {
-        settings_menu_index = 0;
-    }
-    bsp_display_lock(0);
-    /* Update selection highlight */
-    for (int i = 0; i < SETTINGS_MENU_COUNT; i++) {
-        lv_obj_t *item = lv_obj_get_child(settings_menu_list, i);
-        if (item) {
-            lv_obj_t *label = lv_obj_get_child(item, 0);
-            if (label) {
-                if (i == settings_menu_index) {
-                    lv_obj_set_style_text_color(label, lv_color_hex(0x00E5FF), 0);
-                } else {
-                    lv_obj_set_style_text_color(label, lv_color_hex(0xAAAAAA), 0);
-                }
-            }
-        }
-    }
-    bsp_display_unlock();
-    ESP_LOGI(TAG, "Settings menu down: index=%d", settings_menu_index);
+    pending_action = PENDING_SETTINGS_DOWN;
 }
 
-static void app_hw_btn_settings_confirm_cb(void *button_handle, void *usr_data)
+static void __attribute__((unused)) app_hw_btn_settings_confirm_cb(void *button_handle, void *usr_data)
 {
-    if (!is_settings_view) return;
-
-    ESP_LOGI(TAG, "Settings confirm: %s", settings_menu_items[settings_menu_index]);
-    /* TODO: Enter sub-page for selected item */
+    pending_action = PENDING_SETTINGS_CONFIRM;
 }
 
 static void app_hw_btn_rotate_right_cb(void *button_handle, void *usr_data)
 {
-    if (rotation == LV_DISPLAY_ROTATION_270) {
-        rotation = LV_DISPLAY_ROTATION_0;
-    } else {
-        rotation++;
-    }
-    bsp_display_lock(0);
-    bsp_display_rotate(display, rotation);
-    bsp_display_unlock();
-    ESP_LOGI(TAG, "Button rotate right – Rotation: %d", app_lvgl_get_rotation_degrees(rotation));
+    pending_action = PENDING_ROTATE_RIGHT;
 }
 
 static void app_hw_btn_rotate_left_cb(void *button_handle, void *usr_data)
 {
-    if (rotation == LV_DISPLAY_ROTATION_0) {
-        rotation = LV_DISPLAY_ROTATION_270;
-    } else {
-        rotation--;
-    }
-    bsp_display_lock(0);
-    bsp_display_rotate(display, rotation);
-    bsp_display_unlock();
-    ESP_LOGI(TAG, "Button rotate left – Rotation: %d", app_lvgl_get_rotation_degrees(rotation));
+    pending_action = PENDING_ROTATE_LEFT;
 }
 
 static void app_hw_btn_init(void)
@@ -278,9 +355,10 @@ static void app_hw_btn_init(void)
     ESP_LOGI(TAG, "Created %d hardware buttons", btn_cnt);
 
 #if CONFIG_BSP_SELECT_ESP32_S3_EYE
-    /* BSP_BUTTON_1 → toggle view / enter settings */
+    /* BSP_BUTTON_1 → toggle view / enter settings (short press) / confirm in settings (long press) */
     if (btn_handles[BSP_BUTTON_1]) {
         iot_button_register_cb(btn_handles[BSP_BUTTON_1], BUTTON_PRESS_DOWN, NULL, app_hw_btn_toggle_view_cb, NULL);
+        iot_button_register_cb(btn_handles[BSP_BUTTON_1], BUTTON_LONG_PRESS_START, NULL, app_hw_btn_settings_confirm_cb, NULL);
     }
     /* BSP_BUTTON_2 → rotate left / settings up */
     if (btn_handles[BSP_BUTTON_2]) {
@@ -292,7 +370,6 @@ static void app_hw_btn_init(void)
         iot_button_register_cb(btn_handles[BSP_BUTTON_5], BUTTON_PRESS_DOWN, NULL, app_hw_btn_rotate_right_cb, NULL);
         iot_button_register_cb(btn_handles[BSP_BUTTON_5], BUTTON_LONG_PRESS_START, NULL, app_hw_btn_settings_down_cb, NULL);
     }
-    /* Additional button for confirm in settings (using short press of btn2 in settings mode) */
 #else
     if (btn_cnt >= 1) {
         iot_button_register_cb(btn_handles[0], BUTTON_PRESS_DOWN, NULL, app_hw_btn_toggle_view_cb, NULL);
@@ -406,43 +483,44 @@ static void app_imu_read(void)
 
     prev_angle_xy = angle_xy;
 
-    int64_t now = esp_timer_get_time();
-
-    if (target != last_direction) {
-        stable_count = 0;
-        last_direction = target;
-    } else if (target != rotation) {
-        stable_count++;
-        if (stable_count >= STABLE_COUNT_REQUIRED &&
-            (now - last_switch_time) > MIN_SWITCH_INTERVAL_US) {
-
-            int switch_dir = 0;
-            if (rotation == LV_DISPLAY_ROTATION_0 && target == LV_DISPLAY_ROTATION_90) switch_dir = -1;
-            else if (rotation == LV_DISPLAY_ROTATION_0 && target == LV_DISPLAY_ROTATION_270) switch_dir = 1;
-            else if (rotation == LV_DISPLAY_ROTATION_90 && target == LV_DISPLAY_ROTATION_0) switch_dir = 1;
-            else if (rotation == LV_DISPLAY_ROTATION_90 && target == LV_DISPLAY_ROTATION_180) switch_dir = -1;
-            else if (rotation == LV_DISPLAY_ROTATION_180 && target == LV_DISPLAY_ROTATION_90) switch_dir = 1;
-            else if (rotation == LV_DISPLAY_ROTATION_180 && target == LV_DISPLAY_ROTATION_270) switch_dir = -1;
-            else if (rotation == LV_DISPLAY_ROTATION_270 && target == LV_DISPLAY_ROTATION_0) switch_dir = -1;
-            else if (rotation == LV_DISPLAY_ROTATION_270 && target == LV_DISPLAY_ROTATION_180) switch_dir = 1;
-
-            rotation = target;
-            last_switch_time = now;
-            stable_count = 0;
-
-            bsp_display_lock(0);
-            bsp_display_rotate(display, rotation);
-            bsp_display_unlock();
-
-            if (switch_dir == 1) {
-                ESP_LOGI(TAG, ">>> [CW] Auto-rotate to %d", app_lvgl_get_rotation_degrees(rotation));
-            } else if (switch_dir == -1) {
-                ESP_LOGI(TAG, ">>> [CCW] Auto-rotate to %d", app_lvgl_get_rotation_degrees(rotation));
-            } else {
-                ESP_LOGI(TAG, "Auto-rotate to %d", app_lvgl_get_rotation_degrees(rotation));
-            }
-        }
-    }
+    // ===== 三轴自动旋转已禁用 =====
+    // int64_t now = esp_timer_get_time();
+    //
+    // if (target != last_direction) {
+    //     stable_count = 0;
+    //     last_direction = target;
+    // } else if (target != rotation) {
+    //     stable_count++;
+    //     if (stable_count >= STABLE_COUNT_REQUIRED &&
+    //         (now - last_switch_time) > MIN_SWITCH_INTERVAL_US) {
+    //
+    //         int switch_dir = 0;
+    //         if (rotation == LV_DISPLAY_ROTATION_0 && target == LV_DISPLAY_ROTATION_90) switch_dir = -1;
+    //         else if (rotation == LV_DISPLAY_ROTATION_0 && target == LV_DISPLAY_ROTATION_270) switch_dir = 1;
+    //         else if (rotation == LV_DISPLAY_ROTATION_90 && target == LV_DISPLAY_ROTATION_0) switch_dir = 1;
+    //         else if (rotation == LV_DISPLAY_ROTATION_90 && target == LV_DISPLAY_ROTATION_180) switch_dir = -1;
+    //         else if (rotation == LV_DISPLAY_ROTATION_180 && target == LV_DISPLAY_ROTATION_90) switch_dir = 1;
+    //         else if (rotation == LV_DISPLAY_ROTATION_180 && target == LV_DISPLAY_ROTATION_270) switch_dir = -1;
+    //         else if (rotation == LV_DISPLAY_ROTATION_270 && target == LV_DISPLAY_ROTATION_0) switch_dir = -1;
+    //         else if (rotation == LV_DISPLAY_ROTATION_270 && target == LV_DISPLAY_ROTATION_180) switch_dir = 1;
+    //
+    //         rotation = target;
+    //         last_switch_time = now;
+    //         stable_count = 0;
+    //
+    //         bsp_display_lock(0);
+    //         bsp_display_rotate(display, rotation);
+    //         bsp_display_unlock();
+    //
+    //         if (switch_dir == 1) {
+    //             ESP_LOGI(TAG, ">>> [CW] Auto-rotate to %d", app_lvgl_get_rotation_degrees(rotation));
+    //         } else if (switch_dir == -1) {
+    //             ESP_LOGI(TAG, ">>> [CCW] Auto-rotate to %d", app_lvgl_get_rotation_degrees(rotation));
+    //         } else {
+    //             ESP_LOGI(TAG, "Auto-rotate to %d", app_lvgl_get_rotation_degrees(rotation));
+    //         }
+    //     }
+    // }
 }
 #endif /* BSP_CAPS_IMU */
 
@@ -668,6 +746,283 @@ static void camera_lvgl_update_cb(lv_timer_t *timer)
 }
 
 /*******************************************************************************
+ * SPIFFS – mount and helper for photo storage
+ *******************************************************************************/
+static void app_spiffs_mount(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "storage",
+        .max_files = 5,
+        .format_if_mount_failed = true,
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SPIFFS (%s)", esp_err_to_name(ret));
+    } else {
+        size_t total = 0, used = 0;
+        esp_spiffs_info("storage", &total, &used);
+        ESP_LOGI(TAG, "SPIFFS mounted: %zu KB total, %zu KB used", total / 1024, used / 1024);
+    }
+}
+
+/*******************************************************************************
+ * SD Card – mount FAT filesystem on SDMMC 1-bit interface
+ * Falls back gracefully – sd_mounted stays false if no card inserted.
+ *******************************************************************************/
+static void app_sdcard_mount(void)
+{
+    ESP_LOGI(TAG, "Mounting SD card (SDMMC 1-bit)...");
+    ESP_LOGI(TAG, "Pins: CLK=%d CMD=%d D0=%d D3=%d",
+             SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D3_PIN);
+
+    /* SD card power is always on for ESP32-S3-EYE */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.flags = SDMMC_HOST_FLAG_1BIT;    /* 1-bit mode */
+    host.max_freq_khz = SDMMC_FREQ_PROBING; /* 400kHz for reliable init */
+
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = 1;
+    slot.clk = SD_CLK_PIN;
+    slot.cmd = SD_CMD_PIN;
+    slot.d0  = SD_D0_PIN;
+    slot.d1  = GPIO_NUM_NC;
+    slot.d2  = GPIO_NUM_NC;
+    slot.d3  = SD_D3_PIN;               /* D3 MUST have pull-up! */
+    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024,
+    };
+
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot,
+                                            &mount_cfg, &sd_card);
+    if (ret != ESP_OK) {
+        if (ret == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "SD card not detected (timeout) – auto-capture will use SPIFFS");
+        } else {
+            ESP_LOGW(TAG, "SD card mount failed (0x%x) – auto-capture will use SPIFFS", ret);
+        }
+        sd_mounted = false;
+        return;
+    }
+
+    sd_mounted = true;
+    sdmmc_card_print_info(stdout, sd_card);
+    ESP_LOGI(TAG, "SD card mounted at /sdcard");
+}
+
+/*******************************************************************************
+ * Helper: write a single BMP from raw RGB565 buffer to a given file path
+ * Returns true on success.
+ *******************************************************************************/
+static bool save_bmp_to_path(const uint8_t *pixels, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "Cannot open %s for writing", path);
+        return false;
+    }
+
+    /* ── BMP file header (14 bytes) ── */
+    uint16_t bfType = 0x4D42;             /* "BM" */
+    uint32_t bfSize = 14 + 52 + CAM_WIDTH * CAM_HEIGHT * 2;
+    uint16_t bfReserved1 = 0;
+    uint16_t bfReserved2 = 0;
+    uint32_t bfOffBits = 14 + 52;
+
+    /* ── DIB header (BITFIELDS=52 bytes) ── */
+    uint32_t biSize = 52;
+    int32_t  biWidth = CAM_WIDTH;
+    int32_t  biHeight = -(int32_t)CAM_HEIGHT; /* negative = top-down */
+    uint16_t biPlanes = 1;
+    uint16_t biBitCount = 16;
+    uint32_t biCompression = 3;           /* BI_BITFIELDS */
+    uint32_t biSizeImage = CAM_WIDTH * CAM_HEIGHT * 2;
+    int32_t  biXPelsPerMeter = 2835;
+    int32_t  biYPelsPerMeter = 2835;
+    uint32_t biClrUsed = 0;
+    uint32_t biClrImportant = 0;
+
+    /* RGB565 bitfield masks */
+    uint32_t rMask = 0x0000F800;
+    uint32_t gMask = 0x000007E0;
+    uint32_t bMask = 0x0000001F;
+
+    fwrite(&bfType,      2, 1, f);
+    fwrite(&bfSize,       4, 1, f);
+    fwrite(&bfReserved1,  2, 1, f);
+    fwrite(&bfReserved2,  2, 1, f);
+    fwrite(&bfOffBits,    4, 1, f);
+
+    fwrite(&biSize,        4, 1, f);
+    fwrite(&biWidth,      4, 1, f);
+    fwrite(&biHeight,     4, 1, f);
+    fwrite(&biPlanes,     2, 1, f);
+    fwrite(&biBitCount,   2, 1, f);
+    fwrite(&biCompression,4, 1, f);
+    fwrite(&biSizeImage,  4, 1, f);
+    fwrite(&biXPelsPerMeter, 4, 1, f);
+    fwrite(&biYPelsPerMeter, 4, 1, f);
+    fwrite(&biClrUsed,    4, 1, f);
+    fwrite(&biClrImportant, 4, 1, f);
+    fwrite(&rMask, 4, 1, f);
+    fwrite(&gMask, 4, 1, f);
+    fwrite(&bMask, 4, 1, f);
+
+    /* Pixel data: RGB565 raw */
+    fwrite(pixels, 1, CAM_WIDTH * CAM_HEIGHT * 2, f);
+
+    fclose(f);
+    return true;
+}
+
+/*******************************************************************************
+ * Helper: deep-copy the latest camera frame from the ring buffer.
+ * Caller must free the returned buffer with heap_caps_free().
+ * Returns NULL if no frame is available.
+ *******************************************************************************/
+static uint8_t *grab_frame_copy(void)
+{
+    uint8_t *snap = NULL;
+    if (xSemaphoreTake(cam_frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int idx = cam_frame_ready;
+        if (idx >= 0 && cam_frame_buf[idx]) {
+            snap = heap_caps_malloc(CAM_WIDTH * CAM_HEIGHT * 2, MALLOC_CAP_SPIRAM);
+            if (snap) {
+                memcpy(snap, cam_frame_buf[idx], CAM_WIDTH * CAM_HEIGHT * 2);
+            }
+        }
+        xSemaphoreGive(cam_frame_mutex);
+    }
+    return snap;
+}
+
+/*******************************************************************************
+ * Photo capture (manual) – save current camera frame as BMP
+ * Priority: SD card > SPIFFS fallback.
+ *******************************************************************************/
+void app_photo_capture(void)
+{
+    uint8_t *snap = grab_frame_copy();
+    if (!snap) {
+        ESP_LOGW(TAG, "Capture failed: no frame available");
+        if (toast_label) {
+            lv_label_set_text(toast_label, "No frame!");
+        }
+        return;
+    }
+
+    /* Generate filename with timestamp */
+    time_t now = time(NULL);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    char fname[80];
+
+    if (sd_mounted) {
+        snprintf(fname, sizeof(fname),
+                 "/sdcard/photo_%04d%02d%02d_%02d%02d%02d.bmp",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    } else {
+        snprintf(fname, sizeof(fname),
+                 "/spiffs/photo_%04d%02d%02d_%02d%02d%02d.bmp",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+
+    if (save_bmp_to_path(snap, fname)) {
+        ESP_LOGI(TAG, "Photo saved: %s", fname);
+        if (toast_label) {
+            lv_label_set_text(toast_label, "Photo saved!");
+        }
+    } else {
+        if (toast_label) {
+            lv_label_set_text(toast_label, "IO error!");
+        }
+    }
+
+    heap_caps_free(snap);
+}
+
+/*******************************************************************************
+ * Auto-capture task – periodically saves frames to SD card (or SPIFFS fallback)
+ *******************************************************************************/
+static void auto_capture_task(void *arg)
+{
+    ESP_LOGI(TAG, "Auto-capture task started (interval=%" PRIu32 "s)",
+             auto_capture_interval_s);
+
+    /* Wait for the camera to start streaming before first capture */
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    while (1) {
+        /* Check if auto-capture is enabled */
+        if (!auto_capture_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        uint8_t *snap = grab_frame_copy();
+        if (!snap) {
+            ESP_LOGW(TAG, "Auto-capture: no frame, skipping");
+            vTaskDelay(pdMS_TO_TICKS(auto_capture_interval_s * 1000));
+            continue;
+        }
+
+        /* Generate filename with index counter */
+        char fname[40];
+
+        if (sd_mounted) {
+            snprintf(fname, sizeof(fname),
+                     "/sdcard/cap_%05lu.bmp",
+                     (unsigned long)auto_capture_count);
+        } else {
+            snprintf(fname, sizeof(fname),
+                     "/spiffs/cap_%05lu.bmp",
+                     (unsigned long)auto_capture_count);
+        }
+
+        if (save_bmp_to_path(snap, fname)) {
+            auto_capture_count++;
+            ESP_LOGI(TAG, "Auto-capture #%lu: %s", (unsigned long)auto_capture_count, fname);
+            /* rec_blink_timer_cb reads auto_capture_count from LVGL context – thread safe */
+        } else {
+            ESP_LOGE(TAG, "Auto-capture: write failed for %s", fname);
+        }
+
+        heap_caps_free(snap);
+
+        /* Wait for next interval */
+        vTaskDelay(pdMS_TO_TICKS(auto_capture_interval_s * 1000));
+    }
+}
+
+/*******************************************************************************
+ * REC blink timer – toggles the red dot visibility every 500ms
+ *******************************************************************************/
+static void rec_blink_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!rec_label) return;
+
+    static bool visible = true;
+    visible = !visible;
+
+    if (visible) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "#ff0000 REC %lu#", (unsigned long)auto_capture_count);
+        lv_label_set_text(rec_label, buf);
+    } else {
+        lv_label_set_text(rec_label, "");
+    }
+}
+
+/*******************************************************************************
  * LumiTrack UI – Main Screen  (4-zone OSD layout for 240×240)
  * ┌────────────────────┐
  * │     LumiTrack      │  title
@@ -832,6 +1187,19 @@ static void app_camera_lvgl_screen(void)
     lv_obj_align(hint, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(hint, LV_OBJ_FLAG_FLOATING);
 
+    /* ── REC indicator (top-right corner, flashes when auto-capture is on) ── */
+    rec_label = lv_label_create(camera_screen);
+    lv_label_set_text(rec_label, "");
+    lv_label_set_recolor(rec_label, true);  /* enable #RRGGBB text# color tags */
+    lv_obj_set_style_text_color(rec_label, lv_color_hex(0xFF0000), 0);
+    lv_obj_set_style_text_font(rec_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(rec_label, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_add_flag(rec_label, LV_OBJ_FLAG_FLOATING);
+
+    /* Start REC blink timer */
+    rec_blink_timer = lv_timer_create(rec_blink_timer_cb, 500, NULL);
+    lv_timer_ready(rec_blink_timer);
+
     bsp_display_unlock();
 }
 
@@ -862,9 +1230,9 @@ static void app_settings_lvgl_screen(void)
 
     /* ── Title ── */
     lv_obj_t *title = lv_label_create(settings_screen);
-    lv_label_set_text(title, "设备设置");
+    lv_label_set_text(title, "Settings");
     lv_obj_set_style_text_color(title, lv_color_hex(0x00E5FF), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     /* ── Divider ── */
@@ -915,10 +1283,17 @@ static void app_settings_lvgl_screen(void)
 
     /* ── Instruction text ── */
     lv_obj_t *instruction = lv_label_create(settings_screen);
-    lv_label_set_text(instruction, "上下选菜单，确认进入子页面");
+    lv_label_set_text(instruction, "Up/Down: select  |  Press: enter");
     lv_obj_set_style_text_color(instruction, lv_color_hex(0x667777), 0);
-    lv_obj_set_style_text_font(instruction, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_font(instruction, &lv_font_montserrat_12, 0);
     lv_obj_align_to(instruction, settings_menu_list, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+
+    /* ── Toast label for feedback ── */
+    toast_label = lv_label_create(settings_screen);
+    lv_label_set_text(toast_label, "");
+    lv_obj_set_style_text_color(toast_label, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_text_font(toast_label, &lv_font_montserrat_12, 0);
+    lv_obj_align_to(toast_label, instruction, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
 
     /* ── Light control bar at bottom ── */
     lv_obj_t *light_bar = lv_obj_create(settings_screen);
@@ -928,12 +1303,12 @@ static void app_settings_lvgl_screen(void)
     lv_obj_set_style_border_width(light_bar, 1, 0);
     lv_obj_set_style_radius(light_bar, 6, 0);
     lv_obj_set_style_pad_all(light_bar, 2, 0);
-    lv_obj_align_to(light_bar, instruction, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+    lv_obj_align_to(light_bar, toast_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
 
     lv_obj_t *light_label = lv_label_create(light_bar);
-    lv_label_set_text(light_label, "○关灯  ◎调暗  ●调亮");
+    lv_label_set_text(light_label, "off  |  dim  |  bright");
     lv_obj_set_style_text_color(light_label, lv_color_hex(0xCCAA66), 0);
-    lv_obj_set_style_text_font(light_label, &lv_font_montserrat_11, 0);
+    lv_obj_set_style_text_font(light_label, &lv_font_montserrat_12, 0);
     lv_obj_center(light_label);
 
     bsp_display_unlock();
@@ -949,6 +1324,9 @@ void app_main(void)
 
     /* Set display brightness to 100% */
     bsp_display_backlight_on();
+
+    /* Mount SPIFFS for photo storage */
+    app_spiffs_mount();
 
 #if BSP_CAPS_IMU
     app_imu_init();
@@ -999,17 +1377,30 @@ void app_main(void)
     /* Create 50ms timer to refresh camera image on display */
     lv_timer_create(camera_lvgl_update_cb, 50, NULL);
 
-    ESP_LOGI(TAG, "LumiTrack UI initialized. Press [BTN1] to toggle camera view.");
+    /* Mount SD card (non-blocking: if no card, auto-capture falls back to SPIFFS) */
+    app_sdcard_mount();
+
+    /* Start auto-capture task (timed capture to SD card / SPIFFS)
+     * NOT pinned to any core – lets FreeRTOS schedule freely,
+     * avoiding watchdog starvation on Core 1. */
+    xTaskCreate(auto_capture_task, "auto_cap", 4096, NULL, 3, NULL);
+
+    ESP_LOGI(TAG, "LumiTrack initialized. SD:%s  Auto-cap:%" PRIu32 "s  [BTN1]=view",
+             sd_mounted ? "OK" : "N/A", auto_capture_interval_s);
 
 #if BSP_CAPS_IMU
     while (1) {
         app_imu_read();
         lv_timer_handler();
+        app_process_pending_action();
+        app_photo_capture_handler();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 #else
     while (1) {
         lv_timer_handler();
+        app_process_pending_action();
+        app_photo_capture_handler();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 #endif
